@@ -5,6 +5,8 @@ __pycache__/
 venv/
 .env
 .env.*
+!.env.example
+!.env.example
 .pytest_cache/
 .mypy_cache/
 
@@ -12,23 +14,37 @@ venv/
 .DS_Store
 
 # Outputs and runtime artifacts
-# Ignore runtime outputs and generated files but allow the committed model
 # Ignore prediction outputs and verification artifacts
 runs/detect/predict*/
-runs/detect/verify/
-# ignore other generated videos and temporary images
+runs/detect/verify*/
+
+# Specific training run artifacts we don't want to commit
+runs/detect/train/args.yaml
+runs/detect/train/results.csv
+runs/detect/train/weights/last.pt
+
+# Ignore generated videos and temporary images
 *.mp4
 *.mov
 *.avi
 *.db
-# SQLite runtime DB and named DB file
 sack_counts.db
-# temporary debug images
 *.jpg
 *.jpeg
 *.png
+*.log
 
-# keep the trained model file tracked (explicitly add to git)
+# Training datasets and artifacts (do not commit large datasets)
+train/
+valid/
+test/
+data.yaml
+README.dataset.txt
+README.roboflow.txt
+yolo11n.pt
+
+# Ignore all other weights by default, but keep `best.pt` tracked
+runs/detect/train/weights/*.pt
 !runs/detect/train/weights/best.pt
 
 # IDE
