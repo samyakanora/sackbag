@@ -1,157 +1,50 @@
 #!/usr/bin/env python3
 """
-Count objects of a given class crossing a line in a video.
+Count `Sack` objects (class_id=1) crossing a scaled counting line using
+Ultralytics ByteTrack for persistent IDs.
 
 Dependencies:
-  pip install ultralytics opencv-python numpy
+    pip install ultralytics opencv-python numpy
 
-Usage example:
-  python scripts/count_line_cross.py \
-    --source runs/detect/predict-2/IMG_1047.mp4 \
-    --weights yolo11n.pt \
-    --class_name Sack \
-    --line 0.5,0.0,0.5,1.0 \
-    --output runs/detect/predict-2/IMG_1047_counted.mp4
+Usage example (app launcher):
+    python app.py offline --source 20260827170855041.MP4
 
-The `--line` argument expects normalized coordinates x1,y1,x2,y2 (0..1) relative to frame size.
-
+This script scales a reference counting line defined in a 582x328
+coordinate system to the actual input video resolution so that the
+physical line position is preserved across resolutions.
 """
 import argparse
 import math
 import sys
+import time
 from collections import OrderedDict
-
+import os
 import cv2
 import numpy as np
+from datetime import datetime
+
+try:
+    # storage not used for offline visual test, but keep import defensive
+    from storage import init_db, get_today_total, increment, log_event
+    init_db()
+except Exception:
+    def get_today_total():
+        return 0
+    def increment(amount=1):
+        return None
+    def log_event(*args, **kwargs):
+        return None
 
 try:
     from ultralytics import YOLO
 except Exception:
     YOLO = None
 
-
-class CentroidTracker:
-    def __init__(self, max_disappeared=60, max_distance=80, min_iou=0.3):
-        self.next_object_id = 0
-        self.objects = OrderedDict()  # object_id -> centroid
-        self.last_box = {}  # object_id -> last box (x1,y1,x2,y2)
-        self.disappeared = OrderedDict()  # object_id -> frames disappeared
-        self.counted = {}  # object_id -> bool
-        self.max_disappeared = max_disappeared
-        self.max_distance = max_distance
-        self.min_iou = min_iou
-
-    def register(self, centroid, box=None):
-        self.objects[self.next_object_id] = centroid
-        self.last_box[self.next_object_id] = box
-        self.disappeared[self.next_object_id] = 0
-        self.counted[self.next_object_id] = False
-        self.next_object_id += 1
-
-    def deregister(self, object_id):
-        del self.objects[object_id]
-        if object_id in self.last_box:
-            del self.last_box[object_id]
-        del self.disappeared[object_id]
-        del self.counted[object_id]
-
-    def _iou(self, boxA, boxB):
-        if boxA is None or boxB is None:
-            return 0.0
-        xA = max(boxA[0], boxB[0])
-        yA = max(boxA[1], boxB[1])
-        xB = min(boxA[2], boxB[2])
-        yB = min(boxA[3], boxB[3])
-        interW = max(0, xB - xA)
-        interH = max(0, yB - yA)
-        interArea = interW * interH
-        boxAArea = max(0, (boxA[2] - boxA[0])) * max(0, (boxA[3] - boxA[1]))
-        boxBArea = max(0, (boxB[2] - boxB[0])) * max(0, (boxB[3] - boxB[1]))
-        if boxAArea + boxBArea - interArea <= 0:
-            return 0.0
-        return interArea / float(boxAArea + boxBArea - interArea)
+import csv
 
 
-    def update(self, input_centroids, input_boxes=None):
-        if len(input_centroids) == 0:
-            for object_id in list(self.disappeared.keys()):
-                self.disappeared[object_id] += 1
-                if self.disappeared[object_id] > self.max_disappeared:
-                    self.deregister(object_id)
-            return self.objects
-
-        if len(self.objects) == 0:
-            for i, c in enumerate(input_centroids):
-                b = input_boxes[i] if input_boxes is not None and i < len(input_boxes) else None
-                self.register(c, box=b)
-            return self.objects
-
-        object_ids = list(self.objects.keys())
-        object_centroids = list(self.objects.values())
-
-        # prefer IoU based matching using last_box; fallback to centroid distance
-        IOU = np.zeros((len(object_centroids), len(input_centroids)), dtype=float)
-        for i, obj_id in enumerate(object_ids):
-            boxA = self.last_box.get(obj_id, None)
-            for j, boxB in enumerate(input_boxes if input_boxes is not None else [None]*len(input_centroids)):
-                IOU[i, j] = self._iou(boxA, boxB) if boxA is not None and boxB is not None else 0.0
-
-        used_rows = set()
-        used_cols = set()
-
-        # match by IoU first
-        for _ in range(min(IOU.shape[0], IOU.shape[1])):
-            i, j = divmod(IOU.argmax(), IOU.shape[1])
-            if IOU[i, j] <= 0:
-                break
-            object_id = object_ids[i]
-            self.objects[object_id] = input_centroids[j]
-            self.last_box[object_id] = input_boxes[j]
-            self.disappeared[object_id] = 0
-            used_rows.add(i)
-            used_cols.add(j)
-            IOU[i, :] = -1
-            IOU[:, j] = -1
-
-        # remaining unmatched -> distance matching
-        remaining_obj_idxs = [i for i in range(len(object_centroids)) if i not in used_rows]
-        remaining_det_idxs = [j for j in range(len(input_centroids)) if j not in used_cols]
-
-        if remaining_obj_idxs and remaining_det_idxs:
-            D = np.zeros((len(remaining_obj_idxs), len(remaining_det_idxs)), dtype=float)
-            for ii, i in enumerate(remaining_obj_idxs):
-                oc = object_centroids[i]
-                for jj, j in enumerate(remaining_det_idxs):
-                    ic = input_centroids[j]
-                    D[ii, jj] = np.linalg.norm(np.array(oc) - np.array(ic))
-            rows = D.min(axis=1).argsort()
-            cols = D.argmin(axis=1)[rows]
-            for (row, col) in zip(rows, cols):
-                if D[row, col] > self.max_distance:
-                    continue
-                object_id = object_ids[remaining_obj_idxs[row]]
-                det_idx = remaining_det_idxs[cols[row]]
-                self.objects[object_id] = input_centroids[det_idx]
-                self.last_box[object_id] = input_boxes[det_idx] if input_boxes is not None else None
-                self.disappeared[object_id] = 0
-                used_rows.add(remaining_obj_idxs[row])
-                used_cols.add(det_idx)
-
-
-        unused_rows = set(range(0, len(object_centroids))) - used_rows
-        unused_cols = set(range(0, len(input_centroids))) - used_cols
-
-        for row in unused_rows:
-            object_id = object_ids[row]
-            self.disappeared[object_id] += 1
-            if self.disappeared[object_id] > self.max_disappeared:
-                self.deregister(object_id)
-
-        for col in unused_cols:
-            b = input_boxes[col] if input_boxes is not None and col < len(input_boxes) else None
-            self.register(input_centroids[col], box=b)
-
-        return self.objects
+# ByteTrack will be used via Ultralytics `model.track(..., tracker='bytetrack')`.
+# We keep our own minimal bookkeeping for counting and "just counted" display.
 
 
 def parse_line(arg):
@@ -211,13 +104,20 @@ def box_intersects_line(box, a, b):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', required=True, help='input video path')
-    parser.add_argument('--weights', default='yolo11n.pt', help='model weights')
+    # load defaults from config if present
+    try:
+        import config
+    except Exception:
+        config = None
+
+    parser.add_argument('--weights', default=(config.WEIGHTS if config else 'yolo11n.pt'), help='model weights')
     parser.add_argument('--output', default=None, help='output video path')
-    parser.add_argument('--class_name', default='Sack', help='class name to count')
-    parser.add_argument('--class_id', type=int, default=None, help='class id to count (overrides class_name)')
-    parser.add_argument('--line', default='0.5,0.0,0.5,1.0', help='normalized line x1,y1,x2,y2')
-    parser.add_argument('--conf', type=float, default=0.25, help='confidence threshold')
-    parser.add_argument('--max-distance', type=int, default=60, help='max matching distance in pixels')
+    parser.add_argument('--class_name', default=(config.CLASS_NAME if config else 'Sack'), help='class name to count')
+    parser.add_argument('--class_id', type=int, default=(config.CLASS_ID if config else None), help='class id to count (overrides class_name)')
+    parser.add_argument('--line', default=(config.LINE_OFFLINE if config else '0.5,0.0,0.5,1.0'), help='normalized line x1,y1,x2,y2')
+    parser.add_argument('--conf', type=float, default=(config.CONF_OFFLINE if config else 0.25), help='confidence threshold')
+    parser.add_argument('--max-distance', type=int, default=(config.MAX_DISTANCE if config else 60), help='max matching distance in pixels')
+    parser.add_argument('--proceed', action='store_true', help='Proceed past first-frame line check and run full video processing')
     args = parser.parse_args()
 
     if YOLO is None:
@@ -225,6 +125,11 @@ def main():
         sys.exit(1)
 
     model = YOLO(args.weights)
+    # print full class mapping for verification
+    try:
+        print('Model class mapping:', model.names)
+    except Exception:
+        pass
 
     cap = cv2.VideoCapture(args.source)
     if not cap.isOpened():
@@ -241,117 +146,205 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     writer = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
 
-    lx1, ly1, lx2, ly2 = parse_line(args.line)
-    a = (int(lx1 * width), int(ly1 * height))
-    b = (int(lx2 * width), int(ly2 * height))
+    # The user provided a reference resolution and reference coordinates.
+    # Accept line in either reference-pixel coords (e.g. '0,185,530,0') or
+    # normalized coords 'x1,y1,x2,y2' (0..1). Default reference coords below.
+    # Use reference resolution scaling so the physical line is preserved.
+    # Default reference coords per user: (0,185) -> (530,0) with ref 581x328.
+    ref_w = getattr(config, 'REFERENCE_WIDTH', 582) if config else 582
+    ref_h = getattr(config, 'REFERENCE_HEIGHT', 328) if config else 328
 
-    tracker = CentroidTracker(max_distance=args.max_distance)
-    object_prev_side = {}
+    # If the provided --line is a string of integers (reference pixels), use them.
+    try:
+        lx1, ly1, lx2, ly2 = parse_line(args.line)
+    except Exception:
+        # fallback normalized parsing
+        lx1, ly1, lx2, ly2 = 0.0, 0.0, 0.0, 0.0
+
+    # determine whether values are normalized (0..1) or reference-pixel coords
+    if 0.0 <= lx1 <= 1.0 and 0.0 <= ly1 <= 1.0 and 0.0 <= lx2 <= 1.0 and 0.0 <= ly2 <= 1.0:
+        # normalized coordinates relative to frame size
+        a = (int(lx1 * width), int(ly1 * height))
+        b = (int(lx2 * width), int(ly2 * height))
+    else:
+        # treat as reference-pixel coords and scale to actual frame
+        a = (int(lx1 * width / ref_w), int(ly1 * height / ref_h))
+        b = (int(lx2 * width / ref_w), int(ly2 * height / ref_h))
+
+    # Save and show first frame with scaled counting line for verification.
+    cap2 = cv2.VideoCapture(args.source)
+    ok, first = cap2.read()
+    if not ok:
+        print('Failed to read first frame for line check; aborting')
+        cap2.release()
+        return
+    # draw scaled line on first frame
+    frame_check = first.copy()
+    cv2.line(frame_check, a, b, (0, 0, 255), 3)
+    # overlay info
+    cv2.putText(frame_check, 'SCALED LINE CHECK', (10, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    os.makedirs('runs/detect/verify', exist_ok=True)
+    check_path = os.path.join('runs', 'detect', 'verify', 'line_check_first_frame.jpg')
+    cv2.imwrite(check_path, frame_check)
+    print('Saved first-frame line check image to', check_path)
+    print('Inspect the image and re-run with --proceed to process the full video if line placement is correct.')
+    cap2.release()
+    if not args.proceed:
+        return
+
+    # Use ByteTrack via Ultralytics tracker. Start counters fresh for offline test.
     total_count = 0
+    counted_track_ids = set()
+    unique_ids = set()
+    total_sack_detections = 0
+    just_counted_timers = {}  # track_id -> frames remaining to show 'COUNTED'
+    SHOW_COUNTED_FRAMES = 30
 
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_idx += 1
+    # prepare event CSV for offline debug (overwrite existing)
+    events_path = os.path.join('runs', 'detect', 'verify', 'count_events.csv')
+    os.makedirs(os.path.dirname(events_path), exist_ok=True)
+    with open(events_path, 'w', newline='') as fh:
+        csv_writer = csv.writer(fh)
+        csv_writer.writerow(['frame_idx', 'track_id', 'x1', 'y1', 'x2', 'y2', 'conf'])
 
-        # run detection
+    # choose which class id to count (force to 1 if not provided)
+    if args.class_id is not None:
+        target_cls = args.class_id
+    else:
         try:
-            results = model.predict(source=frame, imgsz=640, conf=args.conf, device='')
+            names = model.names
+            target_cls = None
+            for k, v in names.items():
+                if v.lower() == args.class_name.lower():
+                    target_cls = int(k)
+                    break
+            if target_cls is None:
+                target_cls = 1
         except Exception:
-            results = model(frame)
+            target_cls = 1
 
-        # ultralytics returns a list-like of results; take first
-        r = results[0]
+    # iterate using the model.track stream so ByteTrack assigns persistent IDs
+    # Ultralytics expects a tracker YAML filename ('.yaml' or '.yml').
+    stream = model.track(source=args.source, tracker='bytetrack.yaml', stream=True, conf=args.conf, imgsz=640)
+    frame_idx = 0
+    for r in stream:
+        # r is a Results object for one frame
+        frame_idx += 1
+        try:
+            frame = r.orig_img if hasattr(r, 'orig_img') else r.orig_img
+        except Exception:
+            # fallback to OpenCV read if not available
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        boxes = []
+        # extract boxes, classes, confidences, and track ids
         try:
             xyxy = r.boxes.xyxy.cpu().numpy()
             confs = r.boxes.conf.cpu().numpy()
             clss = r.boxes.cls.cpu().numpy().astype(int)
+            ids = r.boxes.id.cpu().numpy().astype(int)
         except Exception:
-            # fallback if boxes attribute differs
             try:
                 xyxy = r.boxes.xyxy.numpy()
                 confs = r.boxes.conf.numpy()
                 clss = r.boxes.cls.numpy().astype(int)
+                ids = r.boxes.id.numpy().astype(int)
             except Exception:
                 xyxy = np.array([])
                 confs = np.array([])
                 clss = np.array([])
+                ids = np.array([])
 
-        # choose which class id to count
-        if args.class_id is not None:
-            target_cls = args.class_id
-        else:
-            # try to map name -> id using model.names if available
-            try:
-                names = model.names
-                target_cls = None
-                for k, v in names.items():
-                    if v.lower() == args.class_name.lower():
-                        target_cls = int(k)
-                        break
-                if target_cls is None:
-                    # fallback: try common index 1 for 'Sack'
-                    target_cls = 1
-            except Exception:
-                target_cls = 1
-
-        det_centroids = []
-        det_boxes = []
+        # process and draw all detections; count only Sack class
         for i, box in enumerate(xyxy):
+            if i >= len(confs):
+                continue
             if confs[i] < args.conf:
                 continue
-            if len(clss) > 0 and clss[i] != target_cls:
-                continue
             x1, y1, x2, y2 = box.astype(int)
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
-            det_centroids.append((cx, cy))
-            det_boxes.append((x1, y1, x2, y2))
+            cls_id = int(clss[i]) if i < len(clss) else None
+            tid = int(ids[i]) if i < len(ids) else None
 
-        objects = tracker.update(det_centroids, det_boxes)
+            # class name
+            try:
+                cls_name = model.names.get(cls_id, str(cls_id)) if model and hasattr(model, 'names') else str(cls_id)
+            except Exception:
+                cls_name = str(cls_id)
 
-        # map current centroids back to boxes for drawing and detect intersection
-        used = set()
-        for obj_id, centroid in objects.items():
-            cx, cy = int(centroid[0]), int(centroid[1])
+            # draw bbox and labels for all classes
+            color = (0, 255, 0) if cls_name.lower() == 'sack' or cls_id == target_cls else (200, 200, 200)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            label = f'{cls_name} {confs[i]:.2f}'
+            cv2.putText(frame, label, (x1, y1 - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            id_text = f'ID: {tid}' if tid is not None else 'ID: -'
+            cv2.putText(frame, id_text, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-            # find matching detection box (closest)
-            best_idx = None
-            best_dist = float('inf')
-            for i, c in enumerate(det_centroids):
-                if i in used:
-                    continue
-                d = math.hypot(cx - c[0], cy - c[1])
-                if d < best_dist:
-                    best_dist = d
-                    best_idx = i
-            if best_idx is not None and best_dist < args.max_distance:
-                used.add(best_idx)
-                x1, y1, x2, y2 = det_boxes[best_idx]
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f'ID {obj_id}', (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 2)
-
-                # count if any part of the box touches the line
+            # bookkeeping
+            if cls_id == target_cls and tid is not None:
+                total_sack_detections += 1
+                unique_ids.add(tid)
+                # check rectangle-line intersection
                 if box_intersects_line((x1, y1, x2, y2), a, b):
-                    if not tracker.counted.get(obj_id, False):
+                    if tid not in counted_track_ids:
                         total_count += 1
-                        tracker.counted[obj_id] = True
+                        counted_track_ids.add(tid)
+                        just_counted_timers[tid] = SHOW_COUNTED_FRAMES
+                        # log event to CSV for later frame extraction
+                        try:
+                            with open(events_path, 'a', newline='') as fh:
+                                w = csv.writer(fh)
+                                w.writerow([frame_idx, tid, x1, y1, x2, y2, f'{confs[i]:.4f}'])
+                        except Exception:
+                            pass
 
-            cv2.circle(frame, (cx, cy), 4, (255, 0, 0), -1)
+        # draw counting line
+        cv2.line(frame, a, b, (0, 0, 255), 3)
 
-        # draw line and overlay
-        cv2.line(frame, a, b, (0, 0, 255), 2)
-        cv2.putText(frame, f'Count: {total_count}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+        # draw big sack count overlay
+        overlay_text = f'SACK COUNT: {total_count}'
+        # large text near top-right
+        tw, th = cv2.getTextSize(overlay_text, cv2.FONT_HERSHEY_SIMPLEX, 1.6, 3)[0]
+        cv2.putText(frame, overlay_text, (max(10, width - tw - 20), 50), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 0, 255), 3)
 
+        # draw 'COUNTED' markers for recently counted ids
+        for tid in list(just_counted_timers.keys()):
+            if just_counted_timers[tid] <= 0:
+                del just_counted_timers[tid]
+                continue
+            # find box for this id to annotate; search in current frame boxes
+            for i, box in enumerate(xyxy):
+                if i < len(ids) and int(ids[i]) == tid:
+                    x1, y1, x2, y2 = box.astype(int)
+                    cv2.putText(frame, 'COUNTED', (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 165, 255), 3)
+            just_counted_timers[tid] -= 1
+
+        # write frame
         writer.write(frame)
 
-    cap.release()
+    # release resources
+    try:
+        cap.release()
+    except Exception:
+        pass
     writer.release()
-    print('Done. Output saved to', args.output)
+
+    # print final report
+    print('\nFinal Report:')
+    print('Model:', args.weights)
+    print('Class ID:', target_cls)
+    print('Tracker: ByteTrack (via ultralytics)')
+    print('Confidence threshold:', args.conf)
+    print('Reference resolution: {}x{}'.format(ref_w, ref_h))
+    print('Actual video resolution: {}x{}'.format(width, height))
+    print('Scaled LINE_START:', a)
+    print('Scaled LINE_END:  ', b)
+    print('Number of Sack detections (frames filtered by conf & cls):', total_sack_detections)
+    print('Number of unique ByteTrack IDs seen:', len(unique_ids))
+    print('Number of Sack IDs touching/crossing line:', len(counted_track_ids))
+    print('Final SACK COUNT:', total_count)
+    print('Output video path:', args.output)
+    print('\nDone. Output saved to', args.output)
 
 
 if __name__ == '__main__':

@@ -24,6 +24,18 @@ from collections import OrderedDict
 import cv2
 import numpy as np
 import requests
+from datetime import datetime
+
+try:
+    from storage import init_db, get_today_total, increment, log_event
+    init_db()
+except Exception:
+    def get_today_total():
+        return 0
+    def increment(amount=1):
+        return None
+    def log_event(*args, **kwargs):
+        return None
 
 try:
     from ultralytics import YOLO
@@ -197,17 +209,22 @@ def annotate_frame(frame, boxes, centroids, ids, a, b, total_count, interval_cou
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--rtsp', required=True, help='RTSP URL')
-    parser.add_argument('--weights', default='yolo11n.pt')
-    parser.add_argument('--line', default='0.5,0.9,0.5,0.1')
-    parser.add_argument('--conf', type=float, default=0.35)
-    parser.add_argument('--class_name', default='Sack')
-    parser.add_argument('--class_id', type=int, default=None)
-    parser.add_argument('--telegram-token', required=True)
-    parser.add_argument('--telegram-chat-id', required=True)
-    parser.add_argument('--update-interval', type=int, default=30, help='seconds between phone updates')
-    parser.add_argument('--max-distance', type=int, default=60)
-    parser.add_argument('--save-snapshots', action='store_true')
+    try:
+        import config
+    except Exception:
+        config = None
+
+    parser.add_argument('--rtsp', default=(config.RTSP_URL if config else ''), help='RTSP URL')
+    parser.add_argument('--weights', default=(config.WEIGHTS if config else 'yolo11n.pt'))
+    parser.add_argument('--line', default=(config.LINE_RTSP if config else '0.5,0.9,0.5,0.1'))
+    parser.add_argument('--conf', type=float, default=(config.CONF_RTSP if config else 0.35))
+    parser.add_argument('--class_name', default=(config.CLASS_NAME if config else 'Sack'))
+    parser.add_argument('--class_id', type=int, default=(config.CLASS_ID if config else None))
+    parser.add_argument('--telegram-token', default=(config.TELEGRAM_TOKEN if config else ''), help='Telegram bot token')
+    parser.add_argument('--telegram-chat-id', default=(config.TELEGRAM_CHAT_ID if config else ''), help='Telegram chat id')
+    parser.add_argument('--update-interval', type=int, default=(config.UPDATE_INTERVAL if config else 30), help='seconds between phone updates')
+    parser.add_argument('--max-distance', type=int, default=(config.MAX_DISTANCE if config else 60))
+    parser.add_argument('--save-snapshots', action='store_true', default=(config.SAVE_SNAPSHOTS if config else False))
     args = parser.parse_args()
 
     if YOLO is None:
@@ -239,7 +256,8 @@ def main():
 
     tracker = CentroidTracker(max_distance=args.max_distance)
     object_prev_side = {}
-    total_count = 0
+    # load today's existing total if storage is available
+    total_count = get_today_total() or 0
     interval_count = 0
 
     last_update = time.time()
@@ -329,6 +347,12 @@ def main():
                         total_count += 1
                         interval_count += 1
                         tracker.counted[obj_id] = True
+                        # persist and log event
+                        try:
+                            increment(1)
+                            log_event(obj_id=obj_id, source='rtsp', details=f'box={x1},{y1},{x2},{y2}')
+                        except Exception:
+                            pass
             object_prev_side[obj_id] = None
 
         now = time.time()

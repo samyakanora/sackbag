@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+
+# OS
+.DS_Store
+
+# Outputs and runtime artifacts
+# Ignore runtime outputs and generated files but allow the committed model
+# Ignore prediction outputs and verification artifacts
+runs/detect/predict*/
+runs/detect/verify/
+# ignore other generated videos and temporary images
+*.mp4
+*.mov
+*.avi
+*.db
+# SQLite runtime DB and named DB file
+sack_counts.db
+# temporary debug images
+*.jpg
+*.jpeg
+*.png
+
+# keep the trained model file tracked (explicitly add to git)
+!runs/detect/train/weights/best.pt
+
+# IDE
+.vscode/
