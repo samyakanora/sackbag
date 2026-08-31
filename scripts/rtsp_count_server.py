@@ -227,6 +227,21 @@ def main():
     parser.add_argument('--save-snapshots', action='store_true', default=(config.SAVE_SNAPSHOTS if config else False))
     args = parser.parse_args()
 
+    # Print configured RTSP source but hide the password.
+    def _mask_rtsp(url):
+        if not url:
+            return '(empty)'
+        try:
+            import re
+            m = re.match(r'(rtsp://[^:]+:)[^@]+(@.+)', url)
+            if m:
+                return m.group(1) + '*****' + m.group(2)
+        except Exception:
+            pass
+        return '(hidden)'
+
+    print('RTSP source:', _mask_rtsp(args.rtsp))
+
     if YOLO is None:
         print('Please install ultralytics: pip install ultralytics')
         sys.exit(1)
@@ -250,9 +265,23 @@ def main():
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
 
+    # Determine counting line coordinates. Support both normalized (0..1)
+    # and reference-pixel coords (scale from config.REFERENCE_WIDTH/HEIGHT).
+    try:
+        ref_w = getattr(config, 'REFERENCE_WIDTH', 582) if config else 582
+        ref_h = getattr(config, 'REFERENCE_HEIGHT', 328) if config else 328
+    except Exception:
+        ref_w, ref_h = 582, 328
+
     lx1, ly1, lx2, ly2 = parse_line(args.line)
-    a = (int(lx1 * width), int(ly1 * height))
-    b = (int(lx2 * width), int(ly2 * height))
+    if 0.0 <= lx1 <= 1.0 and 0.0 <= ly1 <= 1.0 and 0.0 <= lx2 <= 1.0 and 0.0 <= ly2 <= 1.0:
+        # normalized coordinates relative to frame size
+        a = (int(lx1 * width), int(ly1 * height))
+        b = (int(lx2 * width), int(ly2 * height))
+    else:
+        # treat as reference-pixel coords and scale to actual frame
+        a = (int(lx1 * width / ref_w), int(ly1 * height / ref_h))
+        b = (int(lx2 * width / ref_w), int(ly2 * height / ref_h))
 
     tracker = CentroidTracker(max_distance=args.max_distance)
     object_prev_side = {}
@@ -377,6 +406,26 @@ def main():
                 send_telegram(args.telegram_token, args.telegram_chat_id, text)
             interval_count = 0
             last_update = now
+
+        # display annotated frame and allow quitting with 'q'
+        try:
+            # create annotated frame for display (reuse same annotation used for snapshots)
+            annotated_frame = annotate_frame(frame, det_boxes, objects, objects, a, b, total_count, interval_count)
+            cv2.imshow("Sack Counter - Live RTSP", annotated_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print('Quit key pressed, shutting down...')
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                try:
+                    cv2.destroyAllWindows()
+                except Exception:
+                    pass
+                sys.exit(0)
+        except Exception:
+            # If display fails (e.g., headless), continue without crashing
+            pass
 
         # small sleep to be cooperative
         time.sleep(0.01)

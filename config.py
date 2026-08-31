@@ -2,7 +2,9 @@ import os
 
 # Core model and source settings
 WEIGHTS = os.getenv('WEIGHTS', 'runs/detect/train/weights/best.pt')
-RTSP_URL = os.getenv('RTSP_URL', '')
+# Default RTSP URL (percent-encode any '@' in the password as %40).
+# Provides a sensible default when RTSP_URL env var is not set.
+RTSP_URL = os.getenv('RTSP_URL', 'rtsp://admin:Armill%4012@192.168.31.113:554/Streaming/Channels/101')
 
 # Line definitions (normalized x1,y1,x2,y2 strings)
 # Use reference-pixel coords for the offline counting line by default
